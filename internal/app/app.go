@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -43,25 +42,26 @@ func New(logger log.Logger) (*App, error) {
 
 // Run starts the application and blocks until shutdown.
 func (a *App) Run() error {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	a.logger.Info("starting application", "run_address", a.config.RunAddress)
 
 	if a.config.DatabaseURI == "" {
 		return errors.New("DATABASE_URI is required")
 	}
 
-	db, err := database.NewDB(a.config.DatabaseURI)
+	db, err := database.NewDB(database.Config{
+		DSN:            a.config.DatabaseURI,
+		MigrationsPath: "migrations",
+	})
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
 	a.db = db
 	defer a.db.Close()
 
-	a.logger.Info("connected to database")
-
-	if err := db.RunMigrations("migrations"); err != nil {
-		return fmt.Errorf("failed to run migrations: %w", err)
-	}
-	a.logger.Info("migrations applied successfully")
+	a.logger.Info("connected to database, migrations applied")
 
 	txManager := service.NewTransactionManager(db.GetConn())
 
@@ -74,7 +74,7 @@ func (a *App) Run() error {
 	ordersService := service.NewOrdersService(ordersRepo)
 	balanceService := service.NewBalanceService(usersRepo, withdrawalsRepo, txManager, a.logger)
 
-	var accrualClient accrual.Client
+	var accrualClient *accrual.Client
 	if a.config.AccrualSystemAddress != "" {
 		accrualClient, err = accrual.NewClient(accrual.Config{
 			BaseURL:               a.config.AccrualSystemAddress,
@@ -105,7 +105,7 @@ func (a *App) Run() error {
 	}
 
 	var orderProcessor *worker.OrderProcessor
-	workerCtx, workerCancel := context.WithCancel(context.Background())
+	workerCtx, workerCancel := context.WithCancel(ctx)
 	defer workerCancel()
 
 	workerErrors := make(chan error, 1)
@@ -139,9 +139,6 @@ func (a *App) Run() error {
 		serverErrors <- a.server.ListenAndServe()
 	}()
 
-	shutdown := make(chan os.Signal, 1)
-	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
-
 	select {
 	case err := <-serverErrors:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -151,16 +148,16 @@ func (a *App) Run() error {
 		if err != nil && !errors.Is(err, context.Canceled) {
 			a.logger.Error("worker error", "error", err)
 		}
-	case sig := <-shutdown:
-		a.logger.Info("shutdown signal received", "signal", sig)
+	case <-ctx.Done():
+		a.logger.Info("shutdown signal received")
 
 		workerCancel()
 		a.logger.Info("worker shutdown initiated")
 
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		if err := a.server.Shutdown(ctx); err != nil {
+		if err := a.server.Shutdown(shutdownCtx); err != nil {
 			a.logger.Error("graceful shutdown failed", "error", err)
 			if err := a.server.Close(); err != nil {
 				return fmt.Errorf("could not stop server: %w", err)

@@ -8,8 +8,8 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 )
 
-// RunMigrations applies database migrations from the specified path.
-func (db *DB) RunMigrations(migrationsPath string) error {
+// runMigrations applies database migrations from the specified path.
+func (db *DB) runMigrations(migrationsPath string) error {
 	driver, err := postgres.WithInstance(db.conn, &postgres.Config{})
 	if err != nil {
 		return fmt.Errorf("failed to create migration driver: %w", err)

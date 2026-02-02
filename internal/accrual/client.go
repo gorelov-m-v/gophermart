@@ -25,11 +25,6 @@ const (
 	initialBackoff               = 100 * time.Millisecond
 )
 
-// Client defines the interface for accrual system operations.
-type Client interface {
-	GetOrderInfo(ctx context.Context, orderNumber string) (*AccrualResult, error)
-}
-
 // Config holds the configuration for the accrual client.
 type Config struct {
 	BaseURL               string
@@ -39,7 +34,8 @@ type Config struct {
 	Logger                log.Logger
 }
 
-type client struct {
+// Client implements accrual system operations.
+type Client struct {
 	baseURL     string
 	httpClient  *http.Client
 	logger      log.Logger
@@ -48,7 +44,7 @@ type client struct {
 }
 
 // NewClient creates a new accrual system client.
-func NewClient(cfg Config) (Client, error) {
+func NewClient(cfg Config) (*Client, error) {
 	if cfg.BaseURL == "" {
 		return nil, fmt.Errorf("accrual base URL is required")
 	}
@@ -73,10 +69,17 @@ func NewClient(cfg Config) (Client, error) {
 		maxAttempts = defaultMaxAttempts
 	}
 
-	return &client{
+	transport := &retryTransport{
+		base:        http.DefaultTransport,
+		maxAttempts: maxAttempts,
+		logger:      cfg.Logger,
+	}
+
+	return &Client{
 		baseURL: baseURL,
 		httpClient: &http.Client{
-			Timeout: timeout,
+			Timeout:   timeout,
+			Transport: transport,
 		},
 		logger:      cfg.Logger,
 		semaphore:   make(chan struct{}, maxConcurrent),
@@ -84,7 +87,63 @@ func NewClient(cfg Config) (Client, error) {
 	}, nil
 }
 
-func (c *client) GetOrderInfo(ctx context.Context, orderNumber string) (*AccrualResult, error) {
+// retryTransport wraps http.RoundTripper with retry logic.
+type retryTransport struct {
+	base        http.RoundTripper
+	maxAttempts int
+	logger      log.Logger
+}
+
+func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	var lastErr error
+	backoff := initialBackoff
+
+	for attempt := 0; attempt < t.maxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(backoff):
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			}
+			backoff = time.Duration(float64(backoff) * 1.5)
+		}
+
+		resp, err := t.base.RoundTrip(req)
+		if err == nil {
+			if t.logger != nil && attempt > 0 {
+				t.logger.Debug(fmt.Sprintf("request succeeded on attempt %d", attempt+1),
+					"url", req.URL.String())
+			}
+
+			if resp.StatusCode == http.StatusTooManyRequests ||
+				resp.StatusCode >= 500 {
+				return resp, nil
+			}
+
+			return resp, nil
+		}
+
+		lastErr = err
+
+		if t.logger != nil {
+			t.logger.Warn("request failed, will retry",
+				"url", req.URL.String(),
+				"attempt", attempt+1,
+				"error", err)
+		}
+	}
+
+	if t.logger != nil {
+		t.logger.Error("request failed after all attempts",
+			"url", req.URL.String(),
+			"attempts", t.maxAttempts,
+			"error", lastErr)
+	}
+
+	return nil, lastErr
+}
+
+func (c *Client) GetOrderInfo(ctx context.Context, orderNumber string) (*AccrualResult, error) {
 	select {
 	case c.semaphore <- struct{}{}:
 		defer func() { <-c.semaphore }()
@@ -92,58 +151,10 @@ func (c *client) GetOrderInfo(ctx context.Context, orderNumber string) (*Accrual
 		return nil, ctx.Err()
 	}
 
-	var lastErr error
-	backoff := initialBackoff
-
-	for attempt := 0; attempt < c.maxAttempts; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-time.After(backoff):
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-			backoff = time.Duration(float64(backoff) * 1.5)
-		}
-
-		result, err := c.doRequest(ctx, orderNumber)
-
-		if err == nil {
-			if c.logger != nil && attempt > 0 {
-				c.logger.Info("accrual request succeeded after retry",
-					"order", orderNumber,
-					"attempt", attempt+1)
-			}
-			return result, nil
-		}
-
-		if _, ok := err.(*ErrTooManyRequests); ok {
-			return nil, err
-		}
-		if _, ok := err.(*ErrBadResponse); ok {
-			return nil, err
-		}
-
-		lastErr = err
-
-		if c.logger != nil {
-			c.logger.Warn("accrual request failed, will retry",
-				"order", orderNumber,
-				"attempt", attempt+1,
-				"error", err)
-		}
-	}
-
-	if c.logger != nil {
-		c.logger.Error("accrual request failed after all attempts",
-			"order", orderNumber,
-			"attempts", c.maxAttempts,
-			"error", lastErr)
-	}
-
-	return nil, lastErr
+	return c.doRequest(ctx, orderNumber)
 }
 
-func (c *client) doRequest(ctx context.Context, orderNumber string) (*AccrualResult, error) {
+func (c *Client) doRequest(ctx context.Context, orderNumber string) (*AccrualResult, error) {
 	start := time.Now()
 
 	reqURL := fmt.Sprintf("%s/api/orders/%s", c.baseURL, orderNumber)
@@ -204,7 +215,7 @@ func (c *client) doRequest(ctx context.Context, orderNumber string) (*AccrualRes
 	}
 }
 
-func (c *client) handle200(resp *http.Response, orderNumber string, latency time.Duration) (*AccrualResult, error) {
+func (c *Client) handle200(resp *http.Response, orderNumber string, latency time.Duration) (*AccrualResult, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, &ErrBadResponse{Reason: "failed to read response body"}
@@ -249,7 +260,7 @@ func (c *client) handle200(resp *http.Response, orderNumber string, latency time
 	return result, nil
 }
 
-func (c *client) handle429(resp *http.Response, orderNumber string) error {
+func (c *Client) handle429(resp *http.Response, orderNumber string) error {
 	retryAfter := defaultRetryAfter
 	rawRetryAfter := resp.Header.Get("Retry-After")
 
@@ -267,6 +278,12 @@ func (c *client) handle429(resp *http.Response, orderNumber string) error {
 	}
 
 	if retryAfter > 10*time.Minute {
+		if c.logger != nil {
+			c.logger.Warn("retry-after value capped to maximum",
+				"order", orderNumber,
+				"original_retry_after_sec", int(retryAfter.Seconds()),
+				"capped_to_sec", 600)
+		}
 		retryAfter = 10 * time.Minute
 	}
 

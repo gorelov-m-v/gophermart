@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -15,6 +16,11 @@ import (
 	"gophermart/internal/repository"
 	"gophermart/internal/service"
 )
+
+// AccrualClient defines the interface for accrual system operations.
+type AccrualClient interface {
+	GetOrderInfo(ctx context.Context, orderNumber string) (*accrual.AccrualResult, error)
+}
 
 // Config holds the configuration for the order processor.
 type Config struct {
@@ -29,17 +35,20 @@ type Config struct {
 type OrderProcessor struct {
 	ordersRepo    repository.OrdersRepository
 	usersRepo     repository.UsersRepository
-	accrualClient accrual.Client
+	accrualClient AccrualClient
 	txManager     service.TransactionManager
 	config        Config
 	logger        log.Logger
+
+	rateLimitMu    sync.RWMutex
+	rateLimitUntil time.Time
 }
 
 // NewOrderProcessor creates a new OrderProcessor instance.
 func NewOrderProcessor(
 	ordersRepo repository.OrdersRepository,
 	usersRepo repository.UsersRepository,
-	accrualClient accrual.Client,
+	accrualClient AccrualClient,
 	txManager service.TransactionManager,
 	config Config,
 	logger log.Logger,
@@ -78,7 +87,33 @@ func (p *OrderProcessor) Start(ctx context.Context) error {
 	}
 }
 
+func (p *OrderProcessor) isRateLimited() bool {
+	p.rateLimitMu.RLock()
+	defer p.rateLimitMu.RUnlock()
+	return time.Now().Before(p.rateLimitUntil)
+}
+
+func (p *OrderProcessor) setRateLimit(until time.Time) {
+	p.rateLimitMu.Lock()
+	defer p.rateLimitMu.Unlock()
+	if until.After(p.rateLimitUntil) {
+		p.rateLimitUntil = until
+	}
+}
+
+func (p *OrderProcessor) getRateLimitUntil() time.Time {
+	p.rateLimitMu.RLock()
+	defer p.rateLimitMu.RUnlock()
+	return p.rateLimitUntil
+}
+
 func (p *OrderProcessor) processBatch(ctx context.Context) error {
+	if p.isRateLimited() {
+		p.logger.Debug("skipping batch due to rate limit",
+			"rate_limit_until", p.getRateLimitUntil())
+		return nil
+	}
+
 	now := time.Now()
 
 	var orders []*repository.Order
@@ -115,24 +150,30 @@ func (p *OrderProcessor) processBatch(ctx context.Context) error {
 	errChan := make(chan error, len(orders))
 
 	for _, order := range orders {
-		order := order
-
 		sem <- struct{}{}
 
-		go func() {
+		go func(o *repository.Order) {
 			defer func() { <-sem }()
 
-			if err := p.processOrder(ctx, order); err != nil {
+			if p.isRateLimited() {
+				p.logger.Debug("skipping order due to rate limit",
+					"order_id", o.ID,
+					"order_number", o.Number)
+				errChan <- nil
+				return
+			}
+
+			if err := p.processOrder(ctx, o); err != nil {
 				p.logger.Error("failed to process order",
-					"order_id", order.ID,
-					"order_number", order.Number,
+					"order_id", o.ID,
+					"order_number", o.Number,
 					"error", err,
 				)
 				errChan <- err
 			} else {
 				errChan <- nil
 			}
-		}()
+		}(order)
 	}
 
 	for i := 0; i < len(orders); i++ {
@@ -289,7 +330,10 @@ func (p *OrderProcessor) handleError(ctx context.Context, order *repository.Orde
 
 	var errTooMany *accrual.ErrTooManyRequests
 	if errors.As(err, &errTooMany) {
-		nextPollAt := now.Add(errTooMany.RetryAfter)
+		rateLimitUntil := now.Add(errTooMany.RetryAfter)
+		p.setRateLimit(rateLimitUntil)
+
+		nextPollAt := rateLimitUntil
 		lastError := "rate limited"
 
 		updateErr := p.ordersRepo.UpdateAfterPoll(ctx, order.ID, repository.OrderStatusProcessing, nullAccrual, nil, &nextPollAt, pollAttempts, &lastError)
@@ -297,12 +341,12 @@ func (p *OrderProcessor) handleError(ctx context.Context, order *repository.Orde
 			return fmt.Errorf("failed to update after 429: %w", updateErr)
 		}
 
-		p.logger.Warn("rate limited by accrual system",
+		p.logger.Warn("rate limited by accrual system, pausing all requests",
 			"order_id", order.ID,
 			"order_number", order.Number,
 			"user_id", order.UserID,
 			"retry_after", errTooMany.RetryAfter,
-			"next_poll_at", nextPollAt,
+			"rate_limit_until", rateLimitUntil,
 			"poll_attempts", pollAttempts,
 			"latency_ms", latency.Milliseconds(),
 		)

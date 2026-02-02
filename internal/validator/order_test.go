@@ -72,7 +72,8 @@ func TestValidateOrderNumber_InvalidCharacters(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := ValidateOrderNumber(tt.input)
-			if !errors.Is(err, ErrInvalidOrderNumber) {
+			var errInvalidNumber *ErrInvalidOrderNumber
+			if !errors.As(err, &errInvalidNumber) {
 				t.Errorf("expected ErrInvalidOrderNumber, got %v", err)
 			}
 		})
@@ -93,7 +94,8 @@ func TestValidateOrderNumber_InvalidLuhn(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := ValidateOrderNumber(tt.input)
-			if !errors.Is(err, ErrInvalidLuhn) {
+			var errInvalidLuhn *ErrInvalidLuhn
+			if !errors.As(err, &errInvalidLuhn) {
 				t.Errorf("expected ErrInvalidLuhn, got %v", err)
 			}
 		})
@@ -225,63 +227,48 @@ func TestValidateLuhn_Algorithm(t *testing.T) {
 }
 
 func TestValidateOrderNumber_Integration(t *testing.T) {
-	tests := []struct {
-		name        string
-		input       string
-		expectError bool
-		errorType   error
-	}{
-		{
-			name:        "valid with whitespace",
-			input:       "  4561261212345467  ",
-			expectError: false,
-		},
-		{
-			name:        "empty after trim",
-			input:       "   ",
-			expectError: true,
-			errorType:   ErrEmptyOrderNumber,
-		},
-		{
-			name:        "contains letters",
-			input:       "456126121234546A",
-			expectError: true,
-			errorType:   ErrInvalidOrderNumber,
-		},
-		{
-			name:        "invalid luhn",
-			input:       "4561261212345468",
-			expectError: true,
-			errorType:   ErrInvalidLuhn,
-		},
-		{
-			name:        "valid zero",
-			input:       "0",
-			expectError: false,
-		},
-	}
+	t.Run("valid with whitespace", func(t *testing.T) {
+		result, err := ValidateOrderNumber("  4561261212345467  ")
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if result == "" {
+			t.Error("expected non-empty result")
+		}
+	})
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := ValidateOrderNumber(tt.input)
+	t.Run("empty after trim", func(t *testing.T) {
+		_, err := ValidateOrderNumber("   ")
+		if !errors.Is(err, ErrEmptyOrderNumber) {
+			t.Errorf("expected ErrEmptyOrderNumber, got %v", err)
+		}
+	})
 
-			if tt.expectError {
-				if err == nil {
-					t.Error("expected error, got nil")
-				}
-				if tt.errorType != nil && !errors.Is(err, tt.errorType) {
-					t.Errorf("expected error type %v, got %v", tt.errorType, err)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-				}
-				if result == "" {
-					t.Error("expected non-empty result")
-				}
-			}
-		})
-	}
+	t.Run("contains letters", func(t *testing.T) {
+		_, err := ValidateOrderNumber("456126121234546A")
+		var errInvalidNumber *ErrInvalidOrderNumber
+		if !errors.As(err, &errInvalidNumber) {
+			t.Errorf("expected ErrInvalidOrderNumber, got %v", err)
+		}
+	})
+
+	t.Run("invalid luhn", func(t *testing.T) {
+		_, err := ValidateOrderNumber("4561261212345468")
+		var errInvalidLuhn *ErrInvalidLuhn
+		if !errors.As(err, &errInvalidLuhn) {
+			t.Errorf("expected ErrInvalidLuhn, got %v", err)
+		}
+	})
+
+	t.Run("valid zero", func(t *testing.T) {
+		result, err := ValidateOrderNumber("0")
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if result == "" {
+			t.Error("expected non-empty result")
+		}
+	})
 }
 
 func TestValidateOrderNumber_Normalization(t *testing.T) {

@@ -15,9 +15,15 @@ type DB struct {
 	conn *sql.DB
 }
 
-// NewDB creates a new database connection.
-func NewDB(dsn string) (*DB, error) {
-	conn, err := sql.Open("postgres", dsn)
+// Config holds database configuration.
+type Config struct {
+	DSN            string
+	MigrationsPath string
+}
+
+// NewDB creates a new database connection and runs migrations.
+func NewDB(cfg Config) (*DB, error) {
+	conn, err := sql.Open("postgres", cfg.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
@@ -38,7 +44,16 @@ func NewDB(dsn string) (*DB, error) {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	return &DB{conn: conn}, nil
+	db := &DB{conn: conn}
+
+	if cfg.MigrationsPath != "" {
+		if err := db.runMigrations(cfg.MigrationsPath); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to run migrations: %w", err)
+		}
+	}
+
+	return db, nil
 }
 
 // Ping verifies the database connection.

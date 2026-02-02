@@ -3,16 +3,31 @@ package validator
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 )
 
-// Order validation errors.
-var (
-	ErrEmptyOrderNumber   = errors.New("order number cannot be empty")
-	ErrInvalidOrderNumber = errors.New("order number must contain only digits")
-	ErrInvalidLuhn        = errors.New("order number failed Luhn validation")
-)
+// ErrEmptyOrderNumber is returned when order number is empty.
+var ErrEmptyOrderNumber = errors.New("order number cannot be empty")
+
+// ErrInvalidOrderNumber is returned when order number contains non-digit characters.
+type ErrInvalidOrderNumber struct {
+	OrderNumber string
+}
+
+func (e *ErrInvalidOrderNumber) Error() string {
+	return fmt.Sprintf("order number %q must contain only digits", e.OrderNumber)
+}
+
+// ErrInvalidLuhn is returned when order number fails Luhn validation.
+type ErrInvalidLuhn struct {
+	OrderNumber string
+}
+
+func (e *ErrInvalidLuhn) Error() string {
+	return fmt.Sprintf("order number %q failed Luhn validation", e.OrderNumber)
+}
 
 // ValidateOrderNumber validates and normalizes an order number.
 func ValidateOrderNumber(raw string) (string, error) {
@@ -24,12 +39,12 @@ func ValidateOrderNumber(raw string) (string, error) {
 
 	for _, r := range normalized {
 		if r < '0' || r > '9' {
-			return "", ErrInvalidOrderNumber
+			return "", &ErrInvalidOrderNumber{OrderNumber: normalized}
 		}
 	}
 
 	if !ValidateLuhn(normalized) {
-		return "", ErrInvalidLuhn
+		return "", &ErrInvalidLuhn{OrderNumber: normalized}
 	}
 
 	return normalized, nil

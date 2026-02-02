@@ -59,9 +59,11 @@ func (h *OrdersHandler) Upload(w http.ResponseWriter, r *http.Request) {
 
 	orderNumber, err := validator.ValidateOrderNumber(string(body))
 	if err != nil {
+		var errInvalidNumber *validator.ErrInvalidOrderNumber
+		var errInvalidLuhn *validator.ErrInvalidLuhn
 		if errors.Is(err, validator.ErrEmptyOrderNumber) ||
-			errors.Is(err, validator.ErrInvalidOrderNumber) ||
-			errors.Is(err, validator.ErrInvalidLuhn) {
+			errors.As(err, &errInvalidNumber) ||
+			errors.As(err, &errInvalidLuhn) {
 			httputil.WriteError(w, http.StatusUnprocessableEntity, "invalid order number format")
 			return
 		}
